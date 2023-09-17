@@ -383,8 +383,8 @@ def det_matrix(a):
     return np.linalg.det(a)
 
 
-def norm_matrix(a, ord=None):
-    return np.linalg.norm(a, ord)
+def norm_matrix(a, ord=None, axis=None):
+    return np.linalg.norm(a, ord, axis)
 
 
 def cond_matrix(a, p=None):
@@ -605,6 +605,13 @@ class TestLinalgBase(EnableNRTStatsMixin, TestCase):
         For use in norm() and cond() tests.
         """
         msg = "Invalid norm order for matrices."
+        self.assert_error(cfunc, args, msg, ValueError)
+
+    def assert_invalid_array_axis(self, cfunc, args):
+        """
+        For use in norm() tests.
+        """
+        msg = "Invalid axis for array."
         self.assert_error(cfunc, args, msg, ValueError)
 
     def assert_raise_on_empty(self, cfunc, args):
@@ -2126,35 +2133,37 @@ class TestLinalgNorm(TestLinalgSystems):
         # prime sizes
         sizes = [(7, 1), (11, 5), (5, 11), (3, 3), (1, 7)]
         nrm_types = [None, np.inf, -np.inf, 1, -1, 2, -2]
+        arr_axes = [None, 0, 1]
 
         # standard 2D input
-        for size, dtype, order, nrm_type in \
-                product(sizes, self.dtypes, 'FC', nrm_types):
+        for size, dtype, order, nrm_type, arr_axis in \
+                product(sizes, self.dtypes, 'FC', nrm_types, arr_axes):
             # check a full rank matrix
             a = self.specific_sample_matrix(size, dtype, order)
-            check(a, ord=nrm_type)
+            check(a, ord=nrm_type, axis=arr_axis)
 
         # check 2D slices work for the case where xnrm2 is called from
         # BLAS (ord=None) to make sure it is working ok.
         nrm_types = [None]
-        for dtype, nrm_type, order in \
-                product(self.dtypes, nrm_types, 'FC'):
+        arr_axes = [None]
+        for dtype, nrm_type, order, arr_axis in \
+                product(self.dtypes, nrm_types, 'FC', arr_axes):
             a = self.specific_sample_matrix((17, 13), dtype, order)
             # contig for C order
-            check(a[:3], ord=nrm_type)
+            check(a[:3], ord=nrm_type, axis=arr_axis)
 
             # contig for Fortran order
-            check(a[:, 3:], ord=nrm_type)
+            check(a[:, 3:], ord=nrm_type, axis=arr_axis)
 
             # contig for neither order
-            check(a[1, 4::3], ord=nrm_type)
+            check(a[1, 4::3], ord=nrm_type, axis=arr_axis)
 
         # check that numba returns zero for empty arrays. Numpy returns zero
         # for most norm types and raises ValueError for +/-np.inf.
         # there is not a great deal of consistency in Numpy's response so
         # it is not being emulated in Numba
-        for dtype, nrm_type, order in \
-                product(self.dtypes, nrm_types, 'FC'):
+        for dtype, nrm_type, order, arr_axis in \
+                product(self.dtypes, nrm_types, 'FC', arr_axes):
             a = np.empty((0,), dtype=dtype, order=order)
             self.assertEqual(cfunc(a, nrm_type), 0.0)
             a = np.empty((0, 0), dtype=dtype, order=order)
@@ -2180,6 +2189,10 @@ class TestLinalgNorm(TestLinalgSystems):
         # assert 2D input raises for an invalid norm kind kwarg
         self.assert_invalid_norm_kind(cfunc, (np.array([[1., 2.], [3., 4.]],
                                                        dtype=np.float64), 6))
+
+        # assert 2D input raises for invalid axis kwarg
+        self.assert_invalid_array_axis(cfunc, (np.array([[1., 2.], [3., 4.]],
+                                                        dtype=np.float64), None, 2))
 
 
 class TestLinalgCond(TestLinalgBase):

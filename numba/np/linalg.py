@@ -2225,7 +2225,7 @@ def _oneD_norm_2_impl(a):
     return impl
 
 
-def _get_norm_impl(x, ord_flag):
+def _get_norm_impl(x, ord_flag, axis):
     # This function is quite involved as norm supports a large
     # range of values to select different norm types via kwarg `ord`.
     # The implementation below branches on dimension of the input
@@ -2240,6 +2240,11 @@ def _get_norm_impl(x, ord_flag):
     # The return type is always a float, numba differs from numpy in
     # that it returns an input precision specific value whereas numpy
     # always returns np.float64.
+
+    # This function supports computing the norm of an array along a specific
+    # axis. By default, axis=None which means that the `ord` norm of the array
+    # is computed. Specifying an axis computes the norm of the array along
+    # the specified axis.
     nb_ret_type = getattr(x.dtype, "underlying_float", x.dtype)
     np_ret_type = np_support.as_dtype(nb_ret_type)
 
@@ -2254,10 +2259,10 @@ def _get_norm_impl(x, ord_flag):
 
         # handle "ord" being "None", must be done separately
         if ord_flag in (None, types.none):
-            def oneD_impl(x, ord=None):
+            def oneD_impl(x, ord=None, axis=None):
                 return _oneD_norm_2(x)
         else:
-            def oneD_impl(x, ord=None):
+            def oneD_impl(x, ord=None, axis=None):
                 n = len(x)
 
                 # Shortcut to handle zero length arrays
@@ -2337,100 +2342,252 @@ def _get_norm_impl(x, ord_flag):
                 def array_prepare(x):
                     return x.copy()
 
-            # Compute the Frobenius norm, this is the L2,2 induced norm of `x`
-            # which is the L2-norm of x.ravel() and so can be computed via BLAS
-            def twoD_impl(x, ord=None):
-                n = x.size
-                if n == 0:
-                    # reshape() currently doesn't support zero-sized arrays
-                    return 0.0
-                x_c = array_prepare(x)
-                return _oneD_norm_2(x_c.reshape(n))
+            # Compute the Frobenius norm, this is the L2,2 induced norm of `A`
+            # which is the L2-norm of A.ravel() and so can be computed via BLAS
+            # If an axis is provided, the norm is computed along a specific axis
+            # and twoD_impl returns a 1d array, otherwise a scalar.
+            if isinstance(axis, (types.Integer, int)):
+                def twoD_impl(x, ord=None, axis=None):
+                    # Compute the norm along a specific axis
+                    m = x.shape[-2]
+                    n = x.shape[-1]
+                    if axis == 0:
+                        nrm_axis = np.zeros(n, dtype=np_ret_type)
+                        for j in range(n):
+                            nrm_axis[j] = _oneD_norm_2(x[:, j])
+                    elif axis == 1:
+                        nrm_axis = np.zeros(m, dtype=np_ret_type)
+                        for i in range(m):
+                            nrm_axis[i] = _oneD_norm_2(x[i, :])
+                    else:
+                        raise ValueError("Invalid axis for array.")
+                    return nrm_axis
+            elif np_support.is_nonelike(axis):
+                def twoD_impl(x, ord=None, axis=None):
+                    n = x.size
+                    if n == 0:
+                        # reshape() currently doesn't support zero-sized arrays
+                        return 0.0
+                    x_c = array_prepare(x)
+                    return _oneD_norm_2(x_c.reshape(n))
+            else:
+                raise ValueError("Invalid axis for array.")
         else:
             # max value for this dtype
             max_val = np.finfo(np_ret_type.type).max
 
-            def twoD_impl(x, ord=None):
-                n = x.shape[-1]
-                m = x.shape[-2]
+            if isinstance(axis, (types.Integer, int)):
+                def twoD_impl(x, ord=None, axis=None):
+                    n = x.shape[-1]
+                    m = x.shape[-2]
 
-                # Shortcut to handle zero size arrays
-                # this differs slightly to numpy in that
-                # numpy raises errors for some ord values
-                # and in other cases returns zero.
-                if x.size == 0:
-                    return 0.0
+                    if x.size == 0:
+                        return np.zeros(1, dtype=np_ret_type)
 
-                if ord == np.inf:
-                    # max of sum of abs across rows
-                    # max(sum(abs(x)), axis=1)
-                    global_max = 0.
-                    for ii in range(m):
-                        tmp = 0.
-                        for jj in range(n):
-                            tmp += abs(x[ii, jj])
-                        if tmp > global_max:
-                            global_max = tmp
-                    return global_max
+                    if axis not in (0, 1):
+                        raise ValueError("Invalid axis for array.")
 
-                elif ord == -np.inf:
-                    # min of sum of abs across rows
-                    # min(sum(abs(x)), axis=1)
-                    global_min = max_val
-                    for ii in range(m):
-                        tmp = 0.
-                        for jj in range(n):
-                            tmp += abs(x[ii, jj])
-                        if tmp < global_min:
-                            global_min = tmp
-                    return global_min
-                elif ord == 1:
-                    # max of sum of abs across cols
-                    # max(sum(abs(x)), axis=0)
-                    global_max = 0.
-                    for ii in range(n):
-                        tmp = 0.
-                        for jj in range(m):
-                            tmp += abs(x[jj, ii])
-                        if tmp > global_max:
-                            global_max = tmp
-                    return global_max
+                    if ord == np.inf and axis == 0:
+                        # max of abs across rows
+                        # max(abs(x), axis=0)
+                        axis_nrms = np.zeros(n, dtype=np_ret_type)
+                        for j in range(n):
+                            for i in range(m):
+                                axis_nrms[j] = max(abs(x[i, j]), axis_nrms[j])
+                        return axis_nrms
 
-                elif ord == -1:
-                    # min of sum of abs across cols
-                    # min(sum(abs(x)), axis=0)
-                    global_min = max_val
-                    for ii in range(n):
-                        tmp = 0.
-                        for jj in range(m):
-                            tmp += abs(x[jj, ii])
-                        if tmp < global_min:
-                            global_min = tmp
-                    return global_min
+                    elif ord == np.inf and axis == 1:
+                        # max of abs across columns
+                        # max(abs(x), axis=1)
+                        axis_nrms = np.zeros(m, dtype=np_ret_type)
+                        for i in range(m):
+                            for j in range(n):
+                                axis_nrms[i] = max(abs(x[i, j]), axis_nrms[i])
+                        return axis_nrms
 
-                # Results via SVD, singular values are sorted on return
-                # by definition.
-                elif ord == 2:
-                    # max SV
-                    return _compute_singular_values(x)[0]
-                elif ord == -2:
-                    # min SV
-                    return _compute_singular_values(x)[-1]
-                else:
-                    # replicate numpy error
-                    raise ValueError("Invalid norm order for matrices.")
+                    elif ord == -np.inf and axis == 0:
+                        # min of abs across rows
+                        # min(abs(x), axis=0)
+                        axis_nrms = np.full(n, max_val, dtype=np_ret_type)
+                        for j in range(n):
+                            for i in range(m):
+                                axis_nrms[j] = min(abs(x[i, j]), axis_nrms[j])
+                        return axis_nrms
+
+                    elif ord == -np.inf and axis == 1:
+                        # min of abs across columns
+                        # min(abs(x), axis=1)
+                        axis_nrms = np.full(m, max_val, dtype=np_ret_type)
+                        for i in range(m):
+                            for j in range(n):
+                                axis_nrms[i] = min(abs(x[i, j]), axis_nrms[i])
+                        return axis_nrms
+
+                    elif ord == 1 and axis == 0:
+                        # sum of abs across rows
+                        # sum(abs(x), axis=0)
+                        axis_nrms = np.zeros(n, dtype=np_ret_type)
+                        for j in range(n):
+                            for i in range(m):
+                                axis_nrms[j] += abs(x[i, j])
+                        return axis_nrms
+
+                    elif ord == 1 and axis == 1:
+                        # sum of abs across columns
+                        # sum(abs(x), axis=1)
+                        axis_nrms = np.zeros(m, dtype=np_ret_type)
+                        for i in range(m):
+                            for j in range(n):
+                                axis_nrms[i] += abs(x[i, j])
+                        return axis_nrms
+
+                    elif ord == -1 and axis == 0:
+                        # inverse sum of inverse abs across rows
+                        # sum(abs(x)**(-1))**(-1)
+                        axis_nrms = np.zeros(n, dtype=np_ret_type)
+                        for j in range(n):
+                            tmp = 0.
+                            for i in range(m):
+                                tmp += 1 / abs(x[i, j])
+                            axis_nrms[j] = 1 / tmp
+                        return axis_nrms
+
+                    elif ord == -1 and axis == 1:
+                        # inverse sum of inverse abs across columns
+                        # sum(abs(x)**(-1))**(-1)
+                        axis_nrms = np.zeros(m, dtype=np_ret_type)
+                        for i in range(m):
+                            tmp = 0.
+                            for j in range(n):
+                                tmp += 1 / abs(x[i, j])
+                            axis_nrms[i] = 1 / tmp
+                        return axis_nrms
+
+                    elif ord == 2 and axis == 0:
+                        # L2 norm across rows
+                        # sqrt(sum(x ** 2), axis=0)
+                        axis_nrms = np.zeros(n, dtype=np_ret_type)
+                        for j in range(n):
+                            axis_nrms[j] = _oneD_norm_2(x[:, j])
+                        return axis_nrms
+
+                    elif ord == 2 and axis == 1:
+                        # L2 norm across columns
+                        # sqrt(sum(x ** 2), axis=1)
+                        axis_nrms = np.zeros(m, dtype=np_ret_type)
+                        for i in range(m):
+                            axis_nrms[i] = _oneD_norm_2(x[i, :])
+                        return axis_nrms
+
+                    elif ord == -2 and axis == 0:
+                        # inverse root sum of squared coefs across rows
+                        # sum(abs(x)**(-2))**(-1/2)
+                        axis_nrms = np.zeros(n, dtype=np_ret_type)
+                        for j in range(n):
+                            tmp = 0.
+                            for i in range(m):
+                                tmp += 1 / pow(abs(x[i, j]), 2)
+                            axis_nrms[j] = 1 / pow(tmp, 0.5)
+                        return axis_nrms
+
+                    elif ord == -2 and axis == 1:
+                        # inverse root sum of squared coefs across columns
+                        # sum(abs(x)**(-2))**(-1/2)
+                        axis_nrms = np.zeros(m, dtype=np_ret_type)
+                        for i in range(m):
+                            tmp = 0.
+                            for j in range(n):
+                                tmp += 1 / pow(abs(x[i, j]), 2)
+                            axis_nrms[i] = 1 / pow(tmp, 0.5)
+                        return axis_nrms
+
+                    else:
+                        # replicate numpy error
+                        raise ValueError("Invalid norm order for matrices.")
+            elif np_support.is_nonelike(axis):
+                def twoD_impl(x, ord=None, axis=None):
+                    n = x.shape[-1]
+                    m = x.shape[-2]
+
+                    # Shortcut to handle zero size arrays
+                    # this differs slightly to numpy in that
+                    # numpy raises errors for some ord values
+                    # and in other cases returns zero.
+                    if x.size == 0:
+                        return 0.0
+
+                    if ord == np.inf:
+                        # max of sum of abs across rows
+                        # max(sum(abs(x)), axis=1)
+                        global_max = 0.
+                        for ii in range(m):
+                            tmp = 0.
+                            for jj in range(n):
+                                tmp += abs(x[ii, jj])
+                            if tmp > global_max:
+                                global_max = tmp
+                        return global_max
+
+                    elif ord == -np.inf:
+                        # min of sum of abs across rows
+                        # min(sum(abs(x)), axis=1)
+                        global_min = max_val
+                        for ii in range(m):
+                            tmp = 0.
+                            for jj in range(n):
+                                tmp += abs(x[ii, jj])
+                            if tmp < global_min:
+                                global_min = tmp
+                        return global_min
+                    elif ord == 1:
+                        # max of sum of abs across cols
+                        # max(sum(abs(x)), axis=0)
+                        global_max = 0.
+                        for ii in range(n):
+                            tmp = 0.
+                            for jj in range(m):
+                                tmp += abs(x[jj, ii])
+                            if tmp > global_max:
+                                global_max = tmp
+                        return global_max
+
+                    elif ord == -1:
+                        # min of sum of abs across cols
+                        # min(sum(abs(x)), axis=0)
+                        global_min = max_val
+                        for ii in range(n):
+                            tmp = 0.
+                            for jj in range(m):
+                                tmp += abs(x[jj, ii])
+                            if tmp < global_min:
+                                global_min = tmp
+                        return global_min
+
+                    # Results via SVD, singular values are sorted on return
+                    # by definition.
+                    elif ord == 2:
+                        # max SV
+                        return _compute_singular_values(x)[0]
+                    elif ord == -2:
+                        # min SV
+                        return _compute_singular_values(x)[-1]
+                    else:
+                        # replicate numpy error
+                        raise ValueError("Invalid norm order for matrices.")
+            else:
+                raise ValueError("Invalid axis for array.")
         return twoD_impl
     else:
         assert 0  # unreachable
 
 
 @overload(np.linalg.norm)
-def norm_impl(x, ord=None):
+def norm_impl(x, ord=None, axis=None):
     ensure_lapack()
 
     _check_linalg_1_or_2d_matrix(x, "norm")
 
-    return _get_norm_impl(x, ord)
+    return _get_norm_impl(x, ord, axis)
 
 
 @overload(np.linalg.cond)
